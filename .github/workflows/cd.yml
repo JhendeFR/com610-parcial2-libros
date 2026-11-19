@@ -1,0 +1,108 @@
+name: CD - Build, Push y Despliegue en EC2
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: 1. Ejecutar Pruebas
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Instalar dependencias y probar
+        run: |
+          npm ci
+          npm test
+
+  build-and-push:
+    name: 2. Construir y Publicar Imagen Docker
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Definir etiqueta con SHA del commit
+        id: meta
+        run: echo "image_tag=${{ secrets.DOCKERHUB_USERNAME }}/libros-api:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Login en Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and Push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image_tag }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/libros-api:latest
+
+  deploy:
+    name: 3. Desplegar en EC2 con Verificación y Rollback
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    env:
+      NEW_IMAGE: ${{ needs.build-and-push.outputs.image_tag }}
+
+    steps:
+      - name: Configurar clave SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Desplegar contenedor y verificar salud
+        run: |
+          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << EOF
+            set -e
+            echo "Descargando imagen: $NEW_IMAGE"
+            docker pull "$NEW_IMAGE"
+
+            PREV_EXISTS=\$(docker ps -a --format '{{.Names}}' | grep -w "libros-api" || true)
+            docker rm -f libros-api-backup 2>/dev/null || true
+
+            if [ -n "\$PREV_EXISTS" ]; then
+              docker stop libros-api
+              docker rename libros-api libros-api-backup
+            fi
+
+            docker run -d \
+              --name libros-api \
+              --restart unless-stopped \
+              -p 127.0.0.1:3000:3000 \
+              --env-file /opt/libros-api/.env \
+              "$NEW_IMAGE"
+
+            sleep 5
+
+            if curl -sf http://127.0.0.1/health && curl -sf http://127.0.0.1/libros > /dev/null; then
+              echo "Verificación exitosa: /health y /libros responden correctamente."
+              docker rm -f libros-api-backup 2>/dev/null || true
+            else
+              echo "ERROR: Falló la verificación post-despliegue. Ejecutando rollback..."
+              docker rm -f libros-api 2>/dev/null || true
+              if [ -n "\$PREV_EXISTS" ]; then
+                docker rename libros-api-backup libros-api
+                docker start libros-api
+                echo "Rollback completado: versión anterior restaurada."
+              fi
+              exit 1
+            fi
+          EOF
