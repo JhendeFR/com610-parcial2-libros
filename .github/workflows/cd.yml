@@ -58,7 +58,7 @@ jobs:
     needs: build-and-push
     runs-on: ubuntu-latest
     env:
-      NEW_IMAGE: ${{ needs.build-and-push.outputs.image_tag }}
+      NEW_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/libros-api:${{ github.sha }}
 
     steps:
       - name: Configurar clave SSH
@@ -66,7 +66,7 @@ jobs:
           mkdir -p ~/.ssh
           echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+          ssh-keyscan -T 15 -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
 
       - name: Desplegar contenedor y verificar salud
         run: |
